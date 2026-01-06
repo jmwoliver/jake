@@ -219,33 +219,50 @@ test(arch) {
 }
 ```
 
-### Conditionals
+### Match Expressions
 
-Use `if`/`else if`/`else` to branch based on parameter values:
+Use `match` to branch based on constrained parameter values. Match is **exhaustive** - you must handle all possible values:
 
 ```
-build(type: {*debug|release|small}) {
-  if $type == debug {
-    zig build
-  } else if $type == release {
-    zig build -Doptimize=ReleaseFast
-  } else {
-    zig build -Doptimize=ReleaseSmall
+build(type: {*debug|release}) {
+  match $type {
+    debug: {
+      zig build
+    }
+    release: {
+      zig build -Doptimize=ReleaseFast
+    }
   }
 }
 ```
 
-Supported operators: `==` and `!=`
+Multiple values can share the same body using `|`:
 
 ```
-deploy(env: {dev|staging|prod}) {
-  if $env != prod {
-    echo "Deploying to test environment..."
-  } else {
-    echo "Deploying to PRODUCTION!"
+build(type: {*debug|release|fast}) {
+  match $type {
+    debug: {
+      zig build
+    }
+    release | fast: {
+      zig build -Doptimize=ReleaseFast
+    }
   }
 }
 ```
+
+If you forget to handle a value, jake tells you at parse time:
+
+```
+error: match is not exhaustive
+  --> Jakefile:2:9
+   |
+ 2 |   match $type {
+   |         ^^^^
+   = hint: missing values: release
+```
+
+**Note**: `match` can only be used with constrained parameters (those with `{opt1|opt2}` syntax). This ensures all cases are known and can be verified.
 
 ### Comments
 
@@ -369,7 +386,7 @@ error: invalid value 'production' for parameter 'env'
 
 ### Helpful Error Messages
 
-Jake provides clear, colorized error messages with source context:
+Jake provides clear, colorized error messages with source context and hints:
 
 ```
 error: undefined function
@@ -377,6 +394,7 @@ error: undefined function
    |
  5 |   @bild($arch)
    |    ^^^^
+   = hint: did you mean 'build'?
 ```
 
 ## Comparison with Other Tools
@@ -387,7 +405,7 @@ error: undefined function
 | Constrained parameter values | Yes | No | No |
 | Default parameter values | Yes | No | Yes |
 | Call other tasks | `@task()` | Dependencies | Dependencies |
-| Conditionals | Yes | Limited | No |
+| Exhaustive match on parameters | Yes | No | No |
 
 ## License
 

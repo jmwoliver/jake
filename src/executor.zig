@@ -75,46 +75,36 @@ pub const Executor = struct {
             .jake_call => |call| {
                 try self.executeJakeCall(&call, scope);
             },
-            .if_statement => |if_stmt| {
-                try self.executeIfStatement(&if_stmt, scope);
+            .match_statement => |match_stmt| {
+                try self.executeMatchStatement(&match_stmt, scope);
             },
         }
     }
 
-    /// Execute an if/else if/else statement
-    fn executeIfStatement(
+    /// Execute a match statement by finding the matching arm and executing its body
+    fn executeMatchStatement(
         self: *Executor,
-        if_stmt: *const ast.IfStatement,
+        match_stmt: *const ast.MatchStatement,
         scope: *std.StringHashMap([]const u8),
     ) ExecutorError!void {
-        for (if_stmt.branches) |branch| {
-            // Check if this branch should execute
-            const should_execute = if (branch.condition) |condition| blk: {
-                break :blk try self.evaluateCondition(&condition, scope);
-            } else true; // else branch always executes if reached
+        const var_value = scope.get(match_stmt.variable) orelse
+            return error.UndefinedVariable;
 
-            if (should_execute) {
-                for (branch.body) |stmt| {
-                    try self.executeStatement(stmt, scope);
+        // Find matching arm
+        for (match_stmt.arms) |arm| {
+            for (arm.values) |value| {
+                if (std.mem.eql(u8, var_value, value)) {
+                    // Execute this arm's body
+                    for (arm.body) |stmt| {
+                        try self.executeStatement(stmt, scope);
+                    }
+                    return;
                 }
-                return; // Only execute one branch
             }
         }
-    }
 
-    /// Evaluate a condition: returns true if condition matches
-    fn evaluateCondition(
-        self: *Executor,
-        condition: *const ast.Condition,
-        scope: *std.StringHashMap([]const u8),
-    ) ExecutorError!bool {
-        _ = self;
-        const var_value = scope.get(condition.variable) orelse return error.UndefinedVariable;
-
-        return switch (condition.operator) {
-            .equal => std.mem.eql(u8, var_value, condition.value),
-            .not_equal => !std.mem.eql(u8, var_value, condition.value),
-        };
+        // Should never reach here if analyzer did its job
+        unreachable;
     }
 
     /// Execute a shell command by building from parts and interpolating variables

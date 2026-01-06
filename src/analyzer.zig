@@ -30,6 +30,12 @@ pub const AnalyzerError = struct {
         too_many_arguments,
         unknown_parameter,
         default_not_in_opts,
+        // Match statement errors
+        match_on_unconstrained,
+        invalid_match_value,
+        duplicate_match_value,
+        non_exhaustive_match,
+        undefined_variable,
     };
 };
 
@@ -81,20 +87,132 @@ pub const Analyzer = struct {
         }
 
         // Validate function body
-        self.validateStatements(func.body);
+        self.validateStatements(func.body, func);
     }
 
-    fn validateStatements(self: *Analyzer, statements: []const ast.Statement) void {
+    fn validateStatements(self: *Analyzer, statements: []const ast.Statement, func: *const ast.FunctionDef) void {
         for (statements) |stmt| {
             switch (stmt) {
                 .shell_command => {}, // Shell commands are always valid
                 .jake_call => |call| self.validateJakeCall(&call),
-                .if_statement => |if_stmt| {
-                    for (if_stmt.branches) |branch| {
-                        self.validateStatements(branch.body);
-                    }
+                .match_statement => |match_stmt| {
+                    self.validateMatchStatement(&match_stmt, func);
                 },
             }
+        }
+    }
+
+    fn validateMatchStatement(
+        self: *Analyzer,
+        match_stmt: *const ast.MatchStatement,
+        func: *const ast.FunctionDef,
+    ) void {
+        // 1. Find the parameter being matched
+        var param: ?*const ast.ParamSpec = null;
+        for (func.params) |*p| {
+            if (std.mem.eql(u8, p.name, match_stmt.variable)) {
+                param = p;
+                break;
+            }
+        }
+
+        if (param == null) {
+            self.addError(
+                .undefined_variable,
+                match_stmt.variable_loc,
+                "undefined variable in match",
+                null,
+            );
+            return;
+        }
+
+        // 2. Verify param has constrained options
+        const options = param.?.options orelse {
+            self.addError(
+                .match_on_unconstrained,
+                match_stmt.variable_loc,
+                "match can only be used on parameters with constrained values",
+                std.fmt.allocPrint(self.allocator, "add constraints like '{s}: {{opt1|opt2}}' to enable match", .{match_stmt.variable}) catch null,
+            );
+            return;
+        };
+
+        // 3. Check exhaustiveness and validate values
+        var covered = std.StringHashMap(bool).init(self.allocator);
+        defer covered.deinit();
+
+        for (match_stmt.arms) |arm| {
+            for (arm.values) |value| {
+                // Check value is valid option
+                var is_valid = false;
+                for (options) |opt| {
+                    if (std.mem.eql(u8, opt, value)) {
+                        is_valid = true;
+                        break;
+                    }
+                }
+                if (!is_valid) {
+                    // Build valid options string for hint
+                    var opts_list = std.array_list.Managed(u8).init(self.allocator);
+                    for (options, 0..) |opt, i| {
+                        opts_list.appendSlice(opt) catch {};
+                        if (i < options.len - 1) {
+                            opts_list.appendSlice(", ") catch {};
+                        }
+                    }
+                    const opts_str = opts_list.toOwnedSlice() catch null;
+
+                    self.addError(
+                        .invalid_match_value,
+                        match_stmt.variable_loc,
+                        std.fmt.allocPrint(self.allocator, "'{s}' is not a valid option for parameter '{s}'", .{ value, match_stmt.variable }) catch "invalid match value",
+                        if (opts_str) |s| std.fmt.allocPrint(self.allocator, "valid options are: {s}", .{s}) catch null else null,
+                    );
+                }
+
+                // Check for duplicates
+                if (covered.contains(value)) {
+                    self.addError(
+                        .duplicate_match_value,
+                        match_stmt.variable_loc,
+                        std.fmt.allocPrint(self.allocator, "'{s}' appears in multiple match arms", .{value}) catch "duplicate match value",
+                        null,
+                    );
+                } else {
+                    covered.put(value, true) catch {};
+                }
+            }
+
+            // Recursively validate arm body
+            self.validateStatements(arm.body, func);
+        }
+
+        // Check all options are covered
+        var missing = std.array_list.Managed([]const u8).init(self.allocator);
+        defer missing.deinit();
+
+        for (options) |opt| {
+            if (!covered.contains(opt)) {
+                missing.append(opt) catch {};
+            }
+        }
+
+        if (missing.items.len > 0) {
+            // Build missing values string
+            var missing_str = std.array_list.Managed(u8).init(self.allocator);
+            for (missing.items, 0..) |m, i| {
+                missing_str.appendSlice(m) catch {};
+                if (i < missing.items.len - 1) {
+                    missing_str.appendSlice(", ") catch {};
+                }
+            }
+
+            self.addError(
+                .non_exhaustive_match,
+                match_stmt.variable_loc,
+                "match is not exhaustive",
+                std.fmt.allocPrint(self.allocator, "missing values: {s}", .{missing_str.toOwnedSlice() catch "?"}) catch null,
+            );
         }
     }
 
@@ -578,4 +696,165 @@ test "validateArguments handles named underscore placeholder" {
         },
         .err => try std.testing.expect(false),
     }
+}
+
+test "analyzer validates exhaustive match" {
+    const source =
+        \\build(type: {debug|release}) {
+        \\  match $type {
+        \\    debug: {
+        \\      echo debug
+        \\    }
+        \\    release: {
+        \\      echo release
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = @import("parser.zig").Parser.parse(std.testing.allocator, source);
+    defer parsed.deinit();
+
+    var result = Analyzer.analyze(std.testing.allocator, &parsed);
+    defer result.deinit();
+
+    try std.testing.expect(!result.hasErrors());
+}
+
+test "analyzer detects non-exhaustive match" {
+    const source =
+        \\build(type: {debug|release}) {
+        \\  match $type {
+        \\    debug: {
+        \\      echo debug
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = @import("parser.zig").Parser.parse(std.testing.allocator, source);
+    defer parsed.deinit();
+
+    var result = Analyzer.analyze(std.testing.allocator, &parsed);
+    defer result.deinit();
+
+    try std.testing.expect(result.hasErrors());
+    try std.testing.expectEqual(AnalyzerError.Kind.non_exhaustive_match, result.errors[0].kind);
+}
+
+test "analyzer detects match on unconstrained param" {
+    const source =
+        \\build(name) {
+        \\  match $name {
+        \\    foo: {
+        \\      echo foo
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = @import("parser.zig").Parser.parse(std.testing.allocator, source);
+    defer parsed.deinit();
+
+    var result = Analyzer.analyze(std.testing.allocator, &parsed);
+    defer result.deinit();
+
+    try std.testing.expect(result.hasErrors());
+    try std.testing.expectEqual(AnalyzerError.Kind.match_on_unconstrained, result.errors[0].kind);
+}
+
+test "analyzer detects invalid match value" {
+    const source =
+        \\build(type: {debug|release}) {
+        \\  match $type {
+        \\    debug: {
+        \\      echo debug
+        \\    }
+        \\    fast: {
+        \\      echo fast
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = @import("parser.zig").Parser.parse(std.testing.allocator, source);
+    defer parsed.deinit();
+
+    var result = Analyzer.analyze(std.testing.allocator, &parsed);
+    defer result.deinit();
+
+    try std.testing.expect(result.hasErrors());
+    // Should have both invalid_match_value and non_exhaustive_match
+    var has_invalid = false;
+    var has_non_exhaustive = false;
+    for (result.errors) |err| {
+        if (err.kind == .invalid_match_value) has_invalid = true;
+        if (err.kind == .non_exhaustive_match) has_non_exhaustive = true;
+    }
+    try std.testing.expect(has_invalid);
+    try std.testing.expect(has_non_exhaustive);
+}
+
+test "analyzer detects duplicate match value" {
+    const source =
+        \\build(type: {debug|release}) {
+        \\  match $type {
+        \\    debug: {
+        \\      echo debug1
+        \\    }
+        \\    debug: {
+        \\      echo debug2
+        \\    }
+        \\    release: {
+        \\      echo release
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = @import("parser.zig").Parser.parse(std.testing.allocator, source);
+    defer parsed.deinit();
+
+    var result = Analyzer.analyze(std.testing.allocator, &parsed);
+    defer result.deinit();
+
+    try std.testing.expect(result.hasErrors());
+    try std.testing.expectEqual(AnalyzerError.Kind.duplicate_match_value, result.errors[0].kind);
+}
+
+test "analyzer validates multi-value match arms" {
+    const source =
+        \\build(type: {debug|release|small}) {
+        \\  match $type {
+        \\    debug: {
+        \\      echo debug
+        \\    }
+        \\    release | small: {
+        \\      echo optimized
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = @import("parser.zig").Parser.parse(std.testing.allocator, source);
+    defer parsed.deinit();
+
+    var result = Analyzer.analyze(std.testing.allocator, &parsed);
+    defer result.deinit();
+
+    try std.testing.expect(!result.hasErrors());
+}
+
+test "analyzer detects undefined variable in match" {
+    const source =
+        \\build(type: {debug|release}) {
+        \\  match $undefined {
+        \\    debug: {
+        \\      echo debug
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = @import("parser.zig").Parser.parse(std.testing.allocator, source);
+    defer parsed.deinit();
+
+    var result = Analyzer.analyze(std.testing.allocator, &parsed);
+    defer result.deinit();
+
+    try std.testing.expect(result.hasErrors());
+    try std.testing.expectEqual(AnalyzerError.Kind.undefined_variable, result.errors[0].kind);
 }

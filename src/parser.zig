@@ -16,14 +16,15 @@ pub const Parser = struct {
         switch (stmt) {
             .shell_command => |cmd| self.allocator.free(cmd.parts),
             .jake_call => |call| self.allocator.free(call.args),
-            .if_statement => |if_stmt| {
-                for (if_stmt.branches) |branch| {
-                    for (branch.body) |s| {
+            .match_statement => |match_stmt| {
+                for (match_stmt.arms) |arm| {
+                    for (arm.body) |s| {
                         self.freeStatement(s);
                     }
-                    self.allocator.free(branch.body);
+                    self.allocator.free(arm.body);
+                    self.allocator.free(arm.values);
                 }
-                self.allocator.free(if_stmt.branches);
+                self.allocator.free(match_stmt.arms);
             },
         }
     }
@@ -244,7 +245,7 @@ pub const Parser = struct {
         defer pending_parts.deinit();
 
         while (self.current.tag != .r_brace and self.current.tag != .eof) {
-            if (self.current.tag == .kw_if) {
+            if (self.current.tag == .kw_match) {
                 // Flush any pending shell command
                 if (pending_parts.items.len > 0) {
                     try statements.append(.{ .shell_command = .{
@@ -253,9 +254,9 @@ pub const Parser = struct {
                     pending_parts = std.array_list.Managed(ast.CommandPart).init(self.allocator);
                 }
 
-                // If statement
-                const if_stmt = try self.parseIfStatement();
-                try statements.append(.{ .if_statement = if_stmt });
+                // Match statement
+                const match_stmt = try self.parseMatchStatement();
+                try statements.append(.{ .match_statement = match_stmt });
             } else if (self.current.tag == .at_sign) {
                 // Flush any pending shell command
                 if (pending_parts.items.len > 0) {
@@ -294,113 +295,13 @@ pub const Parser = struct {
         return statements.toOwnedSlice();
     }
 
-    /// Parse if/else if/else statement
-    fn parseIfStatement(self: *Parser) ParseError!ast.IfStatement {
-        var branches = std.array_list.Managed(ast.IfBranch).init(self.allocator);
-        errdefer {
-            for (branches.items) |branch| {
-                for (branch.body) |stmt| {
-                    self.freeStatement(stmt);
-                }
-                self.allocator.free(branch.body);
-            }
-            branches.deinit();
-        }
+    /// Parse match statement: match $variable { value: { ... } ... }
+    fn parseMatchStatement(self: *Parser) ParseError!ast.MatchStatement {
+        self.advance(); // consume 'match'
 
-        // Parse 'if' branch
-        self.advance(); // consume 'if'
-        const first_condition = try self.parseCondition();
-        self.skipNewlines();
-
-        if (self.current.tag != .l_brace) {
-            self.addError(.expected_token, self.currentLoc(), "expected '{' after if condition");
-            return error.ParseError;
-        }
-        self.advance(); // consume {
-
-        const first_body = try self.parseBody();
-
-        if (self.current.tag != .r_brace) {
-            self.addError(.expected_token, self.currentLoc(), "expected '}' to close if block");
-            self.allocator.free(first_body);
-            return error.ParseError;
-        }
-        self.advance(); // consume }
-
-        try branches.append(.{
-            .condition = first_condition,
-            .body = first_body,
-        });
-
-        // Parse else if / else branches
-        while (true) {
-            self.skipNewlines();
-
-            if (self.current.tag != .kw_else) break;
-            self.advance(); // consume 'else'
-
-            if (self.current.tag == .kw_if) {
-                // else if branch
-                self.advance(); // consume 'if'
-                const condition = try self.parseCondition();
-                self.skipNewlines();
-
-                if (self.current.tag != .l_brace) {
-                    self.addError(.expected_token, self.currentLoc(), "expected '{' after else if condition");
-                    return error.ParseError;
-                }
-                self.advance(); // consume {
-
-                const body = try self.parseBody();
-
-                if (self.current.tag != .r_brace) {
-                    self.addError(.expected_token, self.currentLoc(), "expected '}' to close else if block");
-                    self.allocator.free(body);
-                    return error.ParseError;
-                }
-                self.advance(); // consume }
-
-                try branches.append(.{
-                    .condition = condition,
-                    .body = body,
-                });
-            } else {
-                // else branch (no condition)
-                self.skipNewlines();
-
-                if (self.current.tag != .l_brace) {
-                    self.addError(.expected_token, self.currentLoc(), "expected '{' after else");
-                    return error.ParseError;
-                }
-                self.advance(); // consume {
-
-                const body = try self.parseBody();
-
-                if (self.current.tag != .r_brace) {
-                    self.addError(.expected_token, self.currentLoc(), "expected '}' to close else block");
-                    self.allocator.free(body);
-                    return error.ParseError;
-                }
-                self.advance(); // consume }
-
-                try branches.append(.{
-                    .condition = null,
-                    .body = body,
-                });
-                break; // else must be the last branch
-            }
-        }
-
-        return .{
-            .branches = try branches.toOwnedSlice(),
-        };
-    }
-
-    /// Parse condition: $variable == value or $variable != value
-    fn parseCondition(self: *Parser) ParseError!ast.Condition {
         // Expect $variable
         if (self.current.tag != .dollar) {
-            self.addError(.expected_token, self.currentLoc(), "expected '$' before variable in condition");
+            self.addError(.expected_token, self.currentLoc(), "expected '$' before variable in match");
             return error.ParseError;
         }
         self.advance(); // consume $
@@ -410,42 +311,104 @@ pub const Parser = struct {
             return error.ParseError;
         }
         const variable = self.tokenSlice(self.current);
+        const variable_loc = self.currentLoc();
         self.advance();
 
-        // Expect == or !=
-        const operator: ast.Condition.Operator = switch (self.current.tag) {
-            .eq_eq => .equal,
-            .bang_eq => .not_equal,
-            else => {
-                self.addError(.expected_token, self.currentLoc(), "expected '==' or '!=' in condition");
-                return error.ParseError;
-            },
-        };
-        self.advance();
+        self.skipNewlines();
 
-        // Expect value (identifier or string literal)
-        const value: []const u8 = switch (self.current.tag) {
-            .identifier => blk: {
-                const v = self.tokenSlice(self.current);
-                self.advance();
-                break :blk v;
-            },
-            .string_literal => blk: {
-                const raw = self.tokenSlice(self.current);
-                const v = raw[1 .. raw.len - 1]; // Strip quotes
-                self.advance();
-                break :blk v;
-            },
-            else => {
-                self.addError(.expected_token, self.currentLoc(), "expected value in condition");
-                return error.ParseError;
-            },
-        };
+        // Expect {
+        if (self.current.tag != .l_brace) {
+            self.addError(.expected_token, self.currentLoc(), "expected '{' after match variable");
+            return error.ParseError;
+        }
+        self.advance(); // consume {
+
+        // Parse arms
+        var arms = std.array_list.Managed(ast.MatchArm).init(self.allocator);
+        errdefer {
+            for (arms.items) |arm| {
+                for (arm.body) |stmt| {
+                    self.freeStatement(stmt);
+                }
+                self.allocator.free(arm.body);
+                self.allocator.free(arm.values);
+            }
+            arms.deinit();
+        }
+
+        self.skipNewlines();
+
+        while (self.current.tag != .r_brace and self.current.tag != .eof) {
+            const arm = try self.parseMatchArm();
+            try arms.append(arm);
+            self.skipNewlines();
+        }
+
+        if (self.current.tag != .r_brace) {
+            self.addError(.expected_token, self.currentLoc(), "expected '}' to close match");
+            return error.ParseError;
+        }
+        self.advance(); // consume }
 
         return .{
             .variable = variable,
-            .operator = operator,
-            .value = value,
+            .variable_loc = variable_loc,
+            .arms = try arms.toOwnedSlice(),
+        };
+    }
+
+    /// Parse a single match arm: value | value2: { ... }
+    fn parseMatchArm(self: *Parser) ParseError!ast.MatchArm {
+        var values = std.array_list.Managed([]const u8).init(self.allocator);
+        errdefer values.deinit();
+
+        // Parse first value
+        if (self.current.tag != .identifier) {
+            self.addError(.expected_token, self.currentLoc(), "expected value in match arm");
+            return error.ParseError;
+        }
+        try values.append(self.tokenSlice(self.current));
+        self.advance();
+
+        // Parse additional values separated by |
+        while (self.current.tag == .pipe) {
+            self.advance(); // consume |
+            if (self.current.tag != .identifier) {
+                self.addError(.expected_token, self.currentLoc(), "expected value after '|'");
+                return error.ParseError;
+            }
+            try values.append(self.tokenSlice(self.current));
+            self.advance();
+        }
+
+        // Expect :
+        if (self.current.tag != .colon) {
+            self.addError(.expected_token, self.currentLoc(), "expected ':' after match value(s)");
+            return error.ParseError;
+        }
+        self.advance(); // consume :
+
+        self.skipNewlines();
+
+        // Expect { for body
+        if (self.current.tag != .l_brace) {
+            self.addError(.expected_token, self.currentLoc(), "expected '{' after ':'");
+            return error.ParseError;
+        }
+        self.advance(); // consume {
+
+        const body = try self.parseBody();
+
+        if (self.current.tag != .r_brace) {
+            self.addError(.expected_token, self.currentLoc(), "expected '}' to close match arm");
+            self.freeBody(body);
+            return error.ParseError;
+        }
+        self.advance(); // consume }
+
+        return .{
+            .values = try values.toOwnedSlice(),
+            .body = body,
         };
     }
 
@@ -945,11 +908,16 @@ test "parser detects duplicate functions" {
     try std.testing.expectEqual(ast.ParseError.Kind.duplicate_function, result.errors.items[0].kind);
 }
 
-test "parser parses simple if statement" {
+test "parser parses simple match statement" {
     const source =
-        \\build(type) {
-        \\  if $type == debug {
-        \\    echo debug
+        \\build(type: {debug|release}) {
+        \\  match $type {
+        \\    debug: {
+        \\      echo debug
+        \\    }
+        \\    release: {
+        \\      echo release
+        \\    }
         \\  }
         \\}
     ;
@@ -961,107 +929,26 @@ test "parser parses simple if statement" {
     try std.testing.expectEqual(@as(usize, 1), func.body.len);
 
     switch (func.body[0]) {
-        .if_statement => |if_stmt| {
-            try std.testing.expectEqual(@as(usize, 1), if_stmt.branches.len);
-            const branch = if_stmt.branches[0];
-            try std.testing.expect(branch.condition != null);
-            try std.testing.expectEqualStrings("type", branch.condition.?.variable);
-            try std.testing.expectEqual(ast.Condition.Operator.equal, branch.condition.?.operator);
-            try std.testing.expectEqualStrings("debug", branch.condition.?.value);
+        .match_statement => |match_stmt| {
+            try std.testing.expectEqualStrings("type", match_stmt.variable);
+            try std.testing.expectEqual(@as(usize, 2), match_stmt.arms.len);
+            try std.testing.expectEqual(@as(usize, 1), match_stmt.arms[0].values.len);
+            try std.testing.expectEqualStrings("debug", match_stmt.arms[0].values[0]);
+            try std.testing.expectEqualStrings("release", match_stmt.arms[1].values[0]);
         },
         else => try std.testing.expect(false),
     }
 }
 
-test "parser parses if/else statement" {
+test "parser parses match with multi-value arms" {
     const source =
-        \\build(type) {
-        \\  if $type == release {
-        \\    echo release
-        \\  } else {
-        \\    echo debug
-        \\  }
-        \\}
-    ;
-    var result = Parser.parse(std.testing.allocator, source);
-    defer result.deinit();
-
-    try std.testing.expect(!result.hasErrors());
-    const func = result.functions.get("build").?;
-    try std.testing.expectEqual(@as(usize, 1), func.body.len);
-
-    switch (func.body[0]) {
-        .if_statement => |if_stmt| {
-            try std.testing.expectEqual(@as(usize, 2), if_stmt.branches.len);
-            // First branch has condition
-            try std.testing.expect(if_stmt.branches[0].condition != null);
-            // Second branch (else) has no condition
-            try std.testing.expect(if_stmt.branches[1].condition == null);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "parser parses if/else if/else chain" {
-    const source =
-        \\build(type) {
-        \\  if $type == debug {
-        \\    echo debug
-        \\  } else if $type == release {
-        \\    echo release
-        \\  } else {
-        \\    echo other
-        \\  }
-        \\}
-    ;
-    var result = Parser.parse(std.testing.allocator, source);
-    defer result.deinit();
-
-    try std.testing.expect(!result.hasErrors());
-    const func = result.functions.get("build").?;
-
-    switch (func.body[0]) {
-        .if_statement => |if_stmt| {
-            try std.testing.expectEqual(@as(usize, 3), if_stmt.branches.len);
-            // if branch
-            try std.testing.expectEqualStrings("debug", if_stmt.branches[0].condition.?.value);
-            // else if branch
-            try std.testing.expectEqualStrings("release", if_stmt.branches[1].condition.?.value);
-            // else branch
-            try std.testing.expect(if_stmt.branches[2].condition == null);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "parser parses != operator in condition" {
-    const source =
-        \\build(type) {
-        \\  if $type != debug {
-        \\    echo not-debug
-        \\  }
-        \\}
-    ;
-    var result = Parser.parse(std.testing.allocator, source);
-    defer result.deinit();
-
-    try std.testing.expect(!result.hasErrors());
-    const func = result.functions.get("build").?;
-
-    switch (func.body[0]) {
-        .if_statement => |if_stmt| {
-            try std.testing.expectEqual(ast.Condition.Operator.not_equal, if_stmt.branches[0].condition.?.operator);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "parser parses nested if statements" {
-    const source =
-        \\build(arch, type) {
-        \\  if $arch == arm64 {
-        \\    if $type == debug {
-        \\      echo arm64-debug
+        \\build(type: {debug|release|small}) {
+        \\  match $type {
+        \\    debug: {
+        \\      echo debug
+        \\    }
+        \\    release | small: {
+        \\      echo optimized
         \\    }
         \\  }
         \\}
@@ -1072,15 +959,57 @@ test "parser parses nested if statements" {
     try std.testing.expect(!result.hasErrors());
     const func = result.functions.get("build").?;
 
-    // Outer if
     switch (func.body[0]) {
-        .if_statement => |outer_if| {
-            try std.testing.expectEqual(@as(usize, 1), outer_if.branches.len);
-            // Inner if
-            try std.testing.expectEqual(@as(usize, 1), outer_if.branches[0].body.len);
-            switch (outer_if.branches[0].body[0]) {
-                .if_statement => |inner_if| {
-                    try std.testing.expectEqualStrings("type", inner_if.branches[0].condition.?.variable);
+        .match_statement => |match_stmt| {
+            try std.testing.expectEqual(@as(usize, 2), match_stmt.arms.len);
+            // First arm has one value
+            try std.testing.expectEqual(@as(usize, 1), match_stmt.arms[0].values.len);
+            // Second arm has two values
+            try std.testing.expectEqual(@as(usize, 2), match_stmt.arms[1].values.len);
+            try std.testing.expectEqualStrings("release", match_stmt.arms[1].values[0]);
+            try std.testing.expectEqualStrings("small", match_stmt.arms[1].values[1]);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "parser parses nested match statements" {
+    const source =
+        \\build(arch: {arm64|x86_64}, type: {debug|release}) {
+        \\  match $arch {
+        \\    arm64: {
+        \\      match $type {
+        \\        debug: {
+        \\          echo arm64-debug
+        \\        }
+        \\        release: {
+        \\          echo arm64-release
+        \\        }
+        \\      }
+        \\    }
+        \\    x86_64: {
+        \\      echo x86_64
+        \\    }
+        \\  }
+        \\}
+    ;
+    var result = Parser.parse(std.testing.allocator, source);
+    defer result.deinit();
+
+    try std.testing.expect(!result.hasErrors());
+    const func = result.functions.get("build").?;
+
+    // Outer match
+    switch (func.body[0]) {
+        .match_statement => |outer_match| {
+            try std.testing.expectEqualStrings("arch", outer_match.variable);
+            try std.testing.expectEqual(@as(usize, 2), outer_match.arms.len);
+            // Inner match in first arm
+            try std.testing.expectEqual(@as(usize, 1), outer_match.arms[0].body.len);
+            switch (outer_match.arms[0].body[0]) {
+                .match_statement => |inner_match| {
+                    try std.testing.expectEqualStrings("type", inner_match.variable);
+                    try std.testing.expectEqual(@as(usize, 2), inner_match.arms.len);
                 },
                 else => try std.testing.expect(false),
             }
@@ -1089,12 +1018,17 @@ test "parser parses nested if statements" {
     }
 }
 
-test "parser parses if with @jake_call in body" {
+test "parser parses match with @jake_call in body" {
     const source =
         \\setup() { echo setup }
-        \\build(type) {
-        \\  if $type == debug {
-        \\    @setup()
+        \\build(type: {debug|release}) {
+        \\  match $type {
+        \\    debug: {
+        \\      @setup()
+        \\    }
+        \\    release: {
+        \\      echo release
+        \\    }
         \\  }
         \\}
     ;
@@ -1105,13 +1039,44 @@ test "parser parses if with @jake_call in body" {
     const func = result.functions.get("build").?;
 
     switch (func.body[0]) {
-        .if_statement => |if_stmt| {
-            switch (if_stmt.branches[0].body[0]) {
+        .match_statement => |match_stmt| {
+            switch (match_stmt.arms[0].body[0]) {
                 .jake_call => |call| {
                     try std.testing.expectEqualStrings("setup", call.name);
                 },
                 else => try std.testing.expect(false),
             }
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "parser parses match with shell commands in body" {
+    const source =
+        \\build(type: {debug|release}) {
+        \\  match $type {
+        \\    debug: {
+        \\      echo building debug
+        \\      zig build
+        \\    }
+        \\    release: {
+        \\      zig build -Doptimize=ReleaseFast
+        \\    }
+        \\  }
+        \\}
+    ;
+    var result = Parser.parse(std.testing.allocator, source);
+    defer result.deinit();
+
+    try std.testing.expect(!result.hasErrors());
+    const func = result.functions.get("build").?;
+
+    switch (func.body[0]) {
+        .match_statement => |match_stmt| {
+            // Debug arm has 2 commands
+            try std.testing.expectEqual(@as(usize, 2), match_stmt.arms[0].body.len);
+            // Release arm has 1 command
+            try std.testing.expectEqual(@as(usize, 1), match_stmt.arms[1].body.len);
         },
         else => try std.testing.expect(false),
     }

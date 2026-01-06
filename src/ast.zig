@@ -38,30 +38,20 @@ pub const Argument = struct {
 pub const Statement = union(enum) {
     shell_command: ShellCommand,
     jake_call: JakeCall,
-    if_statement: IfStatement,
+    match_statement: MatchStatement,
 };
 
-/// Condition for if statements: $variable == value or $variable != value
-pub const Condition = struct {
-    variable: []const u8, // Variable name (without $)
-    operator: Operator,
-    value: []const u8, // Comparison value
-
-    pub const Operator = enum {
-        equal, // ==
-        not_equal, // !=
-    };
-};
-
-/// A single branch of an if/else if/else chain
-pub const IfBranch = struct {
-    condition: ?Condition, // null for final 'else' branch
+/// A single arm of a match statement
+pub const MatchArm = struct {
+    values: []const []const u8, // One or more values (for multi-value arms like "release | fast")
     body: []const Statement,
 };
 
-/// An if/else if/else statement
-pub const IfStatement = struct {
-    branches: []const IfBranch, // if, else if..., else
+/// A match statement for exhaustive branching on constrained parameters
+pub const MatchStatement = struct {
+    variable: []const u8, // Variable name (without $)
+    variable_loc: Location, // Location for error reporting
+    arms: []const MatchArm,
 };
 
 /// A shell command line with variable interpolation
@@ -142,12 +132,13 @@ pub const Ast = struct {
                 .jake_call => |call| {
                     self.allocator.free(call.args);
                 },
-                .if_statement => |if_stmt| {
-                    for (if_stmt.branches) |branch| {
-                        self.freeStatements(branch.body);
-                        self.allocator.free(branch.body);
+                .match_statement => |match_stmt| {
+                    for (match_stmt.arms) |arm| {
+                        self.freeStatements(arm.body);
+                        self.allocator.free(arm.body);
+                        self.allocator.free(arm.values);
                     }
-                    self.allocator.free(if_stmt.branches);
+                    self.allocator.free(match_stmt.arms);
                 },
             }
         }

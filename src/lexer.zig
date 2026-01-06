@@ -32,8 +32,7 @@ pub const Token = struct {
         bang_eq, // !=
 
         // Keywords
-        kw_if,
-        kw_else,
+        kw_match,
 
         // Whitespace/structure
         newline,
@@ -186,10 +185,8 @@ pub const Lexer = struct {
         }
         // Check for keywords
         const ident = self.source[start..self.index];
-        const tag: Token.Tag = if (std.mem.eql(u8, ident, "if"))
-            .kw_if
-        else if (std.mem.eql(u8, ident, "else"))
-            .kw_else
+        const tag: Token.Tag = if (std.mem.eql(u8, ident, "match"))
+            .kw_match
         else
             .identifier;
         return self.makeToken(tag, start, start_line, start_column);
@@ -356,53 +353,49 @@ test "lexer handles dollar sign for variables" {
     try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag);
 }
 
-test "lexer tokenizes if keyword" {
-    const source = "if else";
+test "lexer tokenizes match keyword" {
+    const source = "match";
     var lexer = Lexer.init(source);
 
-    try std.testing.expectEqual(Token.Tag.kw_if, lexer.next().tag);
-    try std.testing.expectEqual(Token.Tag.kw_else, lexer.next().tag);
+    try std.testing.expectEqual(Token.Tag.kw_match, lexer.next().tag);
     try std.testing.expectEqual(Token.Tag.eof, lexer.next().tag);
 }
 
-test "lexer tokenizes == and !=" {
-    const source = "== !=";
+test "lexer tokenizes match statement" {
+    const source = "match $type {";
     var lexer = Lexer.init(source);
 
-    try std.testing.expectEqual(Token.Tag.eq_eq, lexer.next().tag);
-    try std.testing.expectEqual(Token.Tag.bang_eq, lexer.next().tag);
-    try std.testing.expectEqual(Token.Tag.eof, lexer.next().tag);
-}
-
-test "lexer tokenizes if statement" {
-    const source = "if $type == debug {";
-    var lexer = Lexer.init(source);
-
-    try std.testing.expectEqual(Token.Tag.kw_if, lexer.next().tag);
+    try std.testing.expectEqual(Token.Tag.kw_match, lexer.next().tag);
     try std.testing.expectEqual(Token.Tag.dollar, lexer.next().tag);
     try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // type
-    try std.testing.expectEqual(Token.Tag.eq_eq, lexer.next().tag);
-    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // debug
     try std.testing.expectEqual(Token.Tag.l_brace, lexer.next().tag);
 }
 
-test "lexer handles else if" {
-    const source = "else if $x != y";
+test "lexer tokenizes match arm with colon" {
+    const source = "debug: {";
     var lexer = Lexer.init(source);
 
-    try std.testing.expectEqual(Token.Tag.kw_else, lexer.next().tag);
-    try std.testing.expectEqual(Token.Tag.kw_if, lexer.next().tag);
-    try std.testing.expectEqual(Token.Tag.dollar, lexer.next().tag);
-    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // x
-    try std.testing.expectEqual(Token.Tag.bang_eq, lexer.next().tag);
-    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // y
+    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // debug
+    try std.testing.expectEqual(Token.Tag.colon, lexer.next().tag);
+    try std.testing.expectEqual(Token.Tag.l_brace, lexer.next().tag);
 }
 
-test "lexer distinguishes if from identifier starting with if" {
-    const source = "if ifdef iffy";
+test "lexer tokenizes multi-value match arm" {
+    const source = "release | fast: {";
     var lexer = Lexer.init(source);
 
-    try std.testing.expectEqual(Token.Tag.kw_if, lexer.next().tag);
-    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // ifdef
-    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // iffy
+    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // release
+    try std.testing.expectEqual(Token.Tag.pipe, lexer.next().tag);
+    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // fast
+    try std.testing.expectEqual(Token.Tag.colon, lexer.next().tag);
+    try std.testing.expectEqual(Token.Tag.l_brace, lexer.next().tag);
+}
+
+test "lexer distinguishes match from identifier starting with match" {
+    const source = "match matcher matching";
+    var lexer = Lexer.init(source);
+
+    try std.testing.expectEqual(Token.Tag.kw_match, lexer.next().tag);
+    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // matcher
+    try std.testing.expectEqual(Token.Tag.identifier, lexer.next().tag); // matching
 }
