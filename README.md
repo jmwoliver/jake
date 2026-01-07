@@ -372,6 +372,9 @@ jake deploy env=staging
 # Skip to later parameters using _ placeholder
 jake test _ 10
 
+# Call multiple targets with parameters
+jake test arm64 10 deploy
+
 # Use a different Jakefile
 jake -f build.jake test
 ```
