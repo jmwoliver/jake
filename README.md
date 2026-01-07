@@ -191,6 +191,42 @@ greet(name) {
 }
 ```
 
+### Local Variables
+
+Define local variables with `name = "value"` syntax:
+
+```
+build(arch: {arm64|*x86_64}, type: {release|*debug}) {
+  arch_flag = ""
+  match $arch {
+    arm64: {
+      arch_flag = "-Dtarget=aarch64-macos"
+    }
+    x86_64: {
+      arch_flag = "-Dtarget=x86_64-macos"
+    }
+  }
+
+  build_flag = ""
+  match $type {
+    debug: {
+      build_flag = "-Doptimize=Debug"
+    }
+    release: {
+      build_flag = "-Doptimize=ReleaseFast"
+    }
+  }
+
+  zig build $build_flag $arch_flag
+}
+```
+
+Local variables:
+- Can be assigned from string literals (`flag = "-O2"`) or other variables (`target = $arch`)
+- Can be reassigned (mutable)
+- Cannot shadow function parameters (this is an error)
+- Must be defined before use (undefined variables are caught at parse time)
+
 ### Calling Other Functions
 
 Use `@function()` to call another jake function:
@@ -404,6 +440,7 @@ error: undefined function
 | Function parameters | Yes | No | Yes |
 | Constrained parameter values | Yes | No | No |
 | Default parameter values | Yes | No | Yes |
+| Local variables | Yes | Yes | Yes |
 | Call other tasks | `@task()` | Dependencies | Dependencies |
 | Exhaustive match on parameters | Yes | No | No |
 

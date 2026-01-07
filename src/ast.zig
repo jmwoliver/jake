@@ -39,6 +39,13 @@ pub const Statement = union(enum) {
     shell_command: ShellCommand,
     jake_call: JakeCall,
     match_statement: MatchStatement,
+    var_assignment: VarAssignment,
+};
+
+/// A variable assignment: name = value
+pub const VarAssignment = struct {
+    name: []const u8,
+    value: []const CommandPart, // Can contain variable interpolation
 };
 
 /// A single arm of a match statement
@@ -75,6 +82,13 @@ pub const JakeCall = struct {
 pub const CallArg = union(enum) {
     string_literal: []const u8,
     variable_ref: []const u8,
+};
+
+/// Represents a single target invocation from the CLI
+/// e.g., "build arm64 debug" parsed as {name: "build", args: ["arm64", "debug"]}
+pub const TargetInvocation = struct {
+    name: []const u8,
+    args: []const Argument,
 };
 
 pub const FunctionDef = struct {
@@ -139,6 +153,9 @@ pub const Ast = struct {
                         self.allocator.free(arm.values);
                     }
                     self.allocator.free(match_stmt.arms);
+                },
+                .var_assignment => |va| {
+                    self.allocator.free(va.value);
                 },
             }
         }

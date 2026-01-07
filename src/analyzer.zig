@@ -98,6 +98,7 @@ pub const Analyzer = struct {
                 .match_statement => |match_stmt| {
                     self.validateMatchStatement(&match_stmt, func);
                 },
+                .var_assignment => {}, // Variable assignments are always valid
             }
         }
     }

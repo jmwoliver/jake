@@ -1,6 +1,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const analyzer = @import("analyzer.zig");
+const executor = @import("executor.zig");
 
 pub const Diagnostic = struct {
     severity: Severity,
@@ -260,6 +261,14 @@ pub fn printValidationError(
     }
 }
 
+pub fn printChainValidationError(
+    writer: anytype,
+    cve: executor.ChainValidationError,
+    use_color: bool,
+) !void {
+    try printValidationError(writer, cve.err, cve.target_name, use_color);
+}
+
 pub fn printTargetList(
     writer: anytype,
     functions: *const std.StringHashMap(ast.FunctionDef),
@@ -325,7 +334,7 @@ pub fn printHelp(writer: anytype, use_color: bool) !void {
 
     try writer.print("{s}jake{s} - A fast command runner\n\n", .{ bold, reset });
     try writer.print("{s}USAGE:{s}\n", .{ bold, reset });
-    try writer.print("    jake [OPTIONS] [TARGET] [ARGS...]\n\n", .{});
+    try writer.print("    jake [OPTIONS] [TARGET [ARGS...]]...\n\n", .{});
     try writer.print("{s}OPTIONS:{s}\n", .{ bold, reset });
     try writer.print("    {s}-f <FILE>{s}    Use specified Jakefile\n", .{ green, reset });
     try writer.print("    {s}-h, --help{s}  Show this help message\n\n", .{ green, reset });
@@ -333,11 +342,16 @@ pub fn printHelp(writer: anytype, use_color: bool) !void {
     try writer.print("    Positional:  jake build arm64\n", .{});
     try writer.print("    Named:       jake build arch=arm64\n", .{});
     try writer.print("    Placeholder: jake test _ 10       (use '_' for default value)\n\n", .{});
+    try writer.print("{s}CHAINING:{s}\n", .{ bold, reset });
+    try writer.print("    Multiple targets can be chained in a single command.\n", .{});
+    try writer.print("    Arguments are consumed based on each target's parameter count.\n\n", .{});
     try writer.print("{s}EXAMPLES:{s}\n", .{ bold, reset });
-    try writer.print("    jake              List available targets\n", .{});
-    try writer.print("    jake build        Run the 'build' target\n", .{});
-    try writer.print("    jake test lb 5    Run 'test' with args\n", .{});
-    try writer.print("    jake test _ 10    Skip param with default\n", .{});
+    try writer.print("    jake                     List available targets\n", .{});
+    try writer.print("    jake build               Run 'build' with defaults\n", .{});
+    try writer.print("    jake build arm64 debug   Run 'build' with args\n", .{});
+    try writer.print("    jake build _ release     Use default for first arg\n", .{});
+    try writer.print("    jake one two             Chain targets 'one' then 'two'\n", .{});
+    try writer.print("    jake build arm64 test    Run 'build' with arg, then 'test'\n", .{});
 }
 
 // Tests

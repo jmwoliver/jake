@@ -28,6 +28,7 @@ pub const Token = struct {
         at_sign,
         dollar,
         pipe,
+        eq, // =
         eq_eq, // ==
         bang_eq, // !=
 
@@ -198,8 +199,8 @@ pub const Lexer = struct {
             self.advance(); // consume second =
             return self.makeToken(.eq_eq, start, start_line, start_column);
         }
-        // Single = is invalid in jake
-        return self.makeToken(.invalid, start, start_line, start_column);
+        // Single = for assignment
+        return self.makeToken(.eq, start, start_line, start_column);
     }
 
     fn scanBang(self: *Lexer, start: u32, start_line: u32, start_column: u32) Token {

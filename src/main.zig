@@ -5,14 +5,23 @@ const executor = @import("executor.zig");
 const diagnostics = @import("diagnostics.zig");
 const ast = @import("ast.zig");
 
-const Config = struct {
+/// Initial config from CLI flags (before we know function definitions)
+const PreConfig = struct {
     jakefile: []const u8,
-    target: ?[]const u8,
-    args: std.array_list.Managed(ast.Argument),
     show_help: bool,
+    raw_args: []const []const u8, // Remaining non-flag arguments
+};
+
+/// Fully resolved config with target chain
+const Config = struct {
+    targets: std.array_list.Managed(ast.TargetInvocation),
+    allocator: std.mem.Allocator,
 
     fn deinit(self: *Config) void {
-        self.args.deinit();
+        for (self.targets.items) |target| {
+            self.allocator.free(target.args);
+        }
+        self.targets.deinit();
     }
 };
 
@@ -30,26 +39,23 @@ pub fn main() !void {
     const stdout = stdout_file.deprecatedWriter();
     const use_color = stderr_file.getOrEnableAnsiEscapeSupport();
 
-    var config = parseArgs(allocator, args[1..]) catch |err| {
+    // First pass: extract flags and collect raw args
+    const pre_config = parsePreConfig(args[1..]) catch |err| {
         switch (err) {
             error.MissingJakefilePath => {
                 try diagnostics.printExecutionError(stderr, "argument", "-f requires a file path", use_color);
             },
-            error.OutOfMemory => {
-                try diagnostics.printExecutionError(stderr, "memory", "out of memory", use_color);
-            },
         }
         std.process.exit(1);
     };
-    defer config.deinit();
 
-    if (config.show_help) {
+    if (pre_config.show_help) {
         try diagnostics.printHelp(stdout, use_color);
         return;
     }
 
     // Find and load Jakefile
-    const jakefile_path = config.jakefile;
+    const jakefile_path = pre_config.jakefile;
     const source = loadJakefile(allocator, jakefile_path) catch |err| {
         switch (err) {
             error.FileNotFound => {
@@ -85,26 +91,40 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    // No target specified - list available targets
-    if (config.target == null) {
+    // No args specified - list available targets
+    if (pre_config.raw_args.len == 0) {
         try diagnostics.printTargetList(stdout, &parsed.functions, use_color);
         return;
     }
 
-    // Execute target
+    // Second pass: resolve raw args into target chain using function definitions
+    var config = resolveTargetChain(allocator, pre_config.raw_args, &parsed.functions) catch |err| {
+        switch (err) {
+            error.UnknownTarget => |_| {
+                // Error already printed
+            },
+            error.OutOfMemory => {
+                try diagnostics.printExecutionError(stderr, "memory", "out of memory", use_color);
+            },
+        }
+        std.process.exit(1);
+    };
+    defer config.deinit();
+
+    // Execute target chain
     var exec = executor.Executor.init(allocator, &parsed.functions, source);
-    const result = exec.execute(config.target.?, config.args.items);
+    const result = exec.executeChain(config.targets.items);
 
     switch (result) {
         .ok => {},
         .validation_err => |ve| {
-            try diagnostics.printValidationError(stderr, ve, config.target.?, use_color);
+            try diagnostics.printChainValidationError(stderr, ve, use_color);
             std.process.exit(1);
         },
         .err => |err| {
-            switch (err) {
+            switch (err.err) {
                 error.UndefinedFunction => {
-                    try diagnostics.printExecutionError(stderr, "undefined function", config.target.?, use_color);
+                    try diagnostics.printExecutionError(stderr, "undefined function", err.target_name, use_color);
                 },
                 error.UndefinedVariable => {
                     try diagnostics.printExecutionError(stderr, "undefined variable", "variable not defined in scope", use_color);
@@ -121,14 +141,15 @@ pub fn main() !void {
     }
 }
 
-fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Config {
-    var config = Config{
+/// First pass: extract CLI flags and collect remaining args
+fn parsePreConfig(args: []const []const u8) error{MissingJakefilePath}!PreConfig {
+    var config = PreConfig{
         .jakefile = "Jakefile",
-        .target = null,
-        .args = std.array_list.Managed(ast.Argument).init(allocator),
         .show_help = false,
+        .raw_args = &[_][]const u8{},
     };
 
+    var raw_start: usize = 0;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -142,20 +163,78 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Config {
             i += 1;
             if (i >= args.len) return error.MissingJakefilePath;
             config.jakefile = args[i];
+            raw_start = i + 1;
             continue;
         }
 
         if (arg.len > 0 and arg[0] == '-') {
             // Unknown flag, skip for now
+            raw_start = i + 1;
             continue;
         }
 
-        if (config.target == null) {
-            config.target = arg;
-        } else {
-            // Parse as function argument
-            try config.args.append(parseArgument(arg));
+        // First non-flag arg - rest are raw args
+        config.raw_args = args[i..];
+        break;
+    }
+
+    return config;
+}
+
+/// Second pass: resolve raw CLI args into target chain using function definitions
+/// This is the "just-style" parsing that looks ahead at function param counts
+fn resolveTargetChain(
+    allocator: std.mem.Allocator,
+    raw_args: []const []const u8,
+    functions: *const std.StringHashMap(ast.FunctionDef),
+) error{ UnknownTarget, OutOfMemory }!Config {
+    var config = Config{
+        .targets = std.array_list.Managed(ast.TargetInvocation).init(allocator),
+        .allocator = allocator,
+    };
+    errdefer config.deinit();
+
+    var i: usize = 0;
+    while (i < raw_args.len) {
+        const target_name = raw_args[i];
+
+        // Look up the function to know how many params it takes
+        const func = functions.get(target_name) orelse {
+            // Not a known target - print error
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            const use_color = std.fs.File.stderr().getOrEnableAnsiEscapeSupport();
+            const reset = if (use_color) "\x1b[0m" else "";
+            const bold_red = if (use_color) "\x1b[1;31m" else "";
+            stderr.print("{s}error{s}: unknown target '{s}'\n", .{ bold_red, reset, target_name }) catch {};
+            return error.UnknownTarget;
+        };
+
+        i += 1; // Move past target name
+
+        // Collect arguments for this target based on param count
+        var target_args = std.array_list.Managed(ast.Argument).init(allocator);
+        errdefer target_args.deinit();
+
+        const param_count = func.params.len;
+        var args_consumed: usize = 0;
+
+        while (args_consumed < param_count and i < raw_args.len) {
+            const arg = raw_args[i];
+
+            // Check if this arg is actually another target (stop consuming)
+            if (functions.contains(arg)) {
+                break;
+            }
+
+            try target_args.append(parseArgument(arg));
+            args_consumed += 1;
+            i += 1;
         }
+
+        try config.targets.append(.{
+            .name = target_name,
+            .args = try target_args.toOwnedSlice(),
+        });
     }
 
     return config;
@@ -212,49 +291,31 @@ fn loadJakefile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return source;
 }
 
-test "parseArgs parses target" {
-    const allocator = std.testing.allocator;
-    const args = [_][]const u8{"build"};
-
-    var config = try parseArgs(allocator, &args);
-    defer config.deinit();
-
-    try std.testing.expectEqualStrings("build", config.target.?);
-}
-
-test "parseArgs parses positional args" {
-    const allocator = std.testing.allocator;
-    const args = [_][]const u8{ "test", "arm64", "5" };
-
-    var config = try parseArgs(allocator, &args);
-    defer config.deinit();
-
-    try std.testing.expectEqualStrings("test", config.target.?);
-    try std.testing.expectEqual(@as(usize, 2), config.args.items.len);
-    try std.testing.expectEqualStrings("arm64", config.args.items[0].value);
-    try std.testing.expectEqualStrings("5", config.args.items[1].value);
-}
-
-test "parseArgs parses named args" {
-    const allocator = std.testing.allocator;
-    const args = [_][]const u8{ "test", "arch=arm64", "num=5" };
-
-    var config = try parseArgs(allocator, &args);
-    defer config.deinit();
-
-    try std.testing.expectEqualStrings("arm64", config.args.items[0].value);
-    try std.testing.expectEqualStrings("arch", config.args.items[0].name.?);
-}
-
-test "parseArgs handles -f flag" {
-    const allocator = std.testing.allocator;
-    const args = [_][]const u8{ "-f", "custom.jake", "build" };
-
-    var config = try parseArgs(allocator, &args);
-    defer config.deinit();
+test "parsePreConfig extracts jakefile flag" {
+    const args = [_][]const u8{ "-f", "custom.jake", "build", "arg1" };
+    const config = try parsePreConfig(&args);
 
     try std.testing.expectEqualStrings("custom.jake", config.jakefile);
-    try std.testing.expectEqualStrings("build", config.target.?);
+    try std.testing.expectEqual(@as(usize, 2), config.raw_args.len);
+    try std.testing.expectEqualStrings("build", config.raw_args[0]);
+    try std.testing.expectEqualStrings("arg1", config.raw_args[1]);
+}
+
+test "parsePreConfig handles help flag" {
+    const args = [_][]const u8{ "-h", "build" };
+    const config = try parsePreConfig(&args);
+
+    try std.testing.expect(config.show_help);
+}
+
+test "parsePreConfig collects raw args" {
+    const args = [_][]const u8{ "build", "arm64", "test" };
+    const config = try parsePreConfig(&args);
+
+    try std.testing.expectEqual(@as(usize, 3), config.raw_args.len);
+    try std.testing.expectEqualStrings("build", config.raw_args[0]);
+    try std.testing.expectEqualStrings("arm64", config.raw_args[1]);
+    try std.testing.expectEqualStrings("test", config.raw_args[2]);
 }
 
 test "parseArgument handles underscore placeholder" {
@@ -271,15 +332,16 @@ test "parseArgument handles named underscore placeholder" {
     try std.testing.expectEqualStrings("", arg.value);
 }
 
-test "parseArgs with underscore placeholder" {
-    const allocator = std.testing.allocator;
-    const args = [_][]const u8{ "test", "_", "5" };
+test "parseArgument handles named arg" {
+    const arg = parseArgument("arch=arm64");
+    try std.testing.expect(!arg.use_default);
+    try std.testing.expectEqualStrings("arch", arg.name.?);
+    try std.testing.expectEqualStrings("arm64", arg.value);
+}
 
-    var config = try parseArgs(allocator, &args);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(usize, 2), config.args.items.len);
-    try std.testing.expect(config.args.items[0].use_default);
-    try std.testing.expectEqualStrings("5", config.args.items[1].value);
-    try std.testing.expect(!config.args.items[1].use_default);
+test "parseArgument handles positional arg" {
+    const arg = parseArgument("arm64");
+    try std.testing.expect(!arg.use_default);
+    try std.testing.expect(arg.name == null);
+    try std.testing.expectEqualStrings("arm64", arg.value);
 }

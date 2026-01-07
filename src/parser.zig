@@ -26,6 +26,7 @@ pub const Parser = struct {
                 }
                 self.allocator.free(match_stmt.arms);
             },
+            .var_assignment => |va| self.allocator.free(va.value),
         }
     }
 
@@ -279,6 +280,18 @@ pub const Parser = struct {
                     pending_parts = std.array_list.Managed(ast.CommandPart).init(self.allocator);
                 }
                 self.advance();
+            } else if (self.current.tag == .identifier and self.isVarAssignment()) {
+                // Flush any pending shell command
+                if (pending_parts.items.len > 0) {
+                    try statements.append(.{ .shell_command = .{
+                        .parts = try pending_parts.toOwnedSlice(),
+                    } });
+                    pending_parts = std.array_list.Managed(ast.CommandPart).init(self.allocator);
+                }
+
+                // Variable assignment: name = value
+                const var_assign = try self.parseVarAssignment();
+                try statements.append(.{ .var_assignment = var_assign });
             } else {
                 // Shell command content
                 try self.parseShellContent(&pending_parts);
@@ -293,6 +306,37 @@ pub const Parser = struct {
         }
 
         return statements.toOwnedSlice();
+    }
+
+    /// Check if current position looks like a variable assignment (identifier = ...)
+    fn isVarAssignment(self: *Parser) bool {
+        // Save current position to peek ahead
+        var temp_lexer = self.lexer;
+        const next_tok = temp_lexer.next();
+        return next_tok.tag == .eq;
+    }
+
+    /// Parse variable assignment: name = value
+    fn parseVarAssignment(self: *Parser) ParseError!ast.VarAssignment {
+        const name = self.tokenSlice(self.current);
+        self.advance(); // consume identifier
+
+        if (self.current.tag != .eq) {
+            self.addError(.expected_token, self.currentLoc(), "expected '=' in variable assignment");
+            return error.ParseError;
+        }
+        self.advance(); // consume =
+
+        // Parse the value (everything until newline or r_brace)
+        var value_parts = std.array_list.Managed(ast.CommandPart).init(self.allocator);
+        errdefer value_parts.deinit();
+
+        try self.parseShellContent(&value_parts);
+
+        return .{
+            .name = name,
+            .value = try value_parts.toOwnedSlice(),
+        };
     }
 
     /// Parse match statement: match $variable { value: { ... } ... }

@@ -16,6 +16,25 @@ pub const ExecuteResult = union(enum) {
     err: ExecutorError,
 };
 
+/// Result of executing a chain of targets
+pub const ExecuteChainResult = union(enum) {
+    ok: void,
+    validation_err: ChainValidationError,
+    err: ChainExecutionError,
+};
+
+pub const ChainValidationError = struct {
+    target_idx: usize,
+    target_name: []const u8,
+    err: analyzer.ValidationError,
+};
+
+pub const ChainExecutionError = struct {
+    target_idx: usize,
+    target_name: []const u8,
+    err: ExecutorError,
+};
+
 pub const Executor = struct {
     allocator: std.mem.Allocator,
     functions: *const std.StringHashMap(ast.FunctionDef),
@@ -31,6 +50,34 @@ pub const Executor = struct {
             .functions = functions,
             .source = source,
         };
+    }
+
+    /// Execute a chain of targets in sequence
+    pub fn executeChain(
+        self: *Executor,
+        targets: []const ast.TargetInvocation,
+    ) ExecuteChainResult {
+        for (targets, 0..) |target, idx| {
+            const result = self.execute(target.name, target.args);
+            switch (result) {
+                .ok => continue,
+                .validation_err => |ve| {
+                    return .{ .validation_err = .{
+                        .target_idx = idx,
+                        .target_name = target.name,
+                        .err = ve,
+                    } };
+                },
+                .err => |err| {
+                    return .{ .err = .{
+                        .target_idx = idx,
+                        .target_name = target.name,
+                        .err = err,
+                    } };
+                },
+            }
+        }
+        return .{ .ok = {} };
     }
 
     pub fn execute(
@@ -52,9 +99,18 @@ pub const Executor = struct {
             .ok => |*scope| {
                 defer scope.deinit();
 
+                // Track dynamically allocated strings that need to be freed
+                var owned_strings = std.array_list.Managed([]const u8).init(self.allocator);
+                defer {
+                    for (owned_strings.items) |s| {
+                        self.allocator.free(s);
+                    }
+                    owned_strings.deinit();
+                }
+
                 // Execute each statement
                 for (func.body) |stmt| {
-                    self.executeStatement(stmt, scope) catch |err| {
+                    self.executeStatement(stmt, scope, &owned_strings) catch |err| {
                         return .{ .err = err };
                     };
                 }
@@ -67,6 +123,7 @@ pub const Executor = struct {
         self: *Executor,
         stmt: ast.Statement,
         scope: *std.StringHashMap([]const u8),
+        owned_strings: *std.array_list.Managed([]const u8),
     ) ExecutorError!void {
         switch (stmt) {
             .shell_command => |cmd| {
@@ -76,9 +133,45 @@ pub const Executor = struct {
                 try self.executeJakeCall(&call, scope);
             },
             .match_statement => |match_stmt| {
-                try self.executeMatchStatement(&match_stmt, scope);
+                try self.executeMatchStatement(&match_stmt, scope, owned_strings);
+            },
+            .var_assignment => |va| {
+                try self.executeVarAssignment(&va, scope, owned_strings);
             },
         }
+    }
+
+    /// Execute a variable assignment by evaluating the RHS and storing in scope
+    fn executeVarAssignment(
+        self: *Executor,
+        va: *const ast.VarAssignment,
+        scope: *std.StringHashMap([]const u8),
+        owned_strings: *std.array_list.Managed([]const u8),
+    ) ExecutorError!void {
+        // Build the value string from parts (with variable interpolation)
+        var result = std.array_list.Managed(u8).init(self.allocator);
+        defer result.deinit();
+
+        for (va.value) |part| {
+            switch (part) {
+                .text => |text| {
+                    result.appendSlice(text) catch return error.OutOfMemory;
+                },
+                .variable => |var_name| {
+                    const value = scope.get(var_name) orelse return error.UndefinedVariable;
+                    result.appendSlice(value) catch return error.OutOfMemory;
+                },
+            }
+        }
+
+        // Duplicate the string so it outlives the result array
+        const value = self.allocator.dupe(u8, result.items) catch return error.OutOfMemory;
+
+        // Track for cleanup
+        owned_strings.append(value) catch return error.OutOfMemory;
+
+        // Store in scope (may overwrite previous value)
+        scope.put(va.name, value) catch return error.OutOfMemory;
     }
 
     /// Execute a match statement by finding the matching arm and executing its body
@@ -86,6 +179,7 @@ pub const Executor = struct {
         self: *Executor,
         match_stmt: *const ast.MatchStatement,
         scope: *std.StringHashMap([]const u8),
+        owned_strings: *std.array_list.Managed([]const u8),
     ) ExecutorError!void {
         const var_value = scope.get(match_stmt.variable) orelse
             return error.UndefinedVariable;
@@ -96,7 +190,7 @@ pub const Executor = struct {
                 if (std.mem.eql(u8, var_value, value)) {
                     // Execute this arm's body
                     for (arm.body) |stmt| {
-                        try self.executeStatement(stmt, scope);
+                        try self.executeStatement(stmt, scope, owned_strings);
                     }
                     return;
                 }
@@ -171,8 +265,18 @@ pub const Executor = struct {
             },
             .ok => |*scope| {
                 defer scope.deinit();
+
+                // Track dynamically allocated strings for this call's scope
+                var owned_strings = std.array_list.Managed([]const u8).init(self.allocator);
+                defer {
+                    for (owned_strings.items) |s| {
+                        self.allocator.free(s);
+                    }
+                    owned_strings.deinit();
+                }
+
                 for (func.body) |stmt| {
-                    try self.executeStatement(stmt, scope);
+                    try self.executeStatement(stmt, scope, &owned_strings);
                 }
             },
         }
