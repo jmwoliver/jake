@@ -42,8 +42,10 @@ pub const AnalyzerError = struct {
 pub const AnalysisResult = struct {
     errors: []const AnalyzerError,
     allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *AnalysisResult) void {
+        self.arena.deinit(); // Frees all diagnostic strings
         self.allocator.free(self.errors);
     }
 
@@ -56,12 +58,14 @@ pub const Analyzer = struct {
     allocator: std.mem.Allocator,
     parsed_ast: *const ast.Ast,
     errors: std.array_list.Managed(AnalyzerError),
+    string_arena: std.heap.ArenaAllocator,
 
     pub fn init(allocator: std.mem.Allocator, parsed_ast: *const ast.Ast) Analyzer {
         return .{
             .allocator = allocator,
             .parsed_ast = parsed_ast,
             .errors = std.array_list.Managed(AnalyzerError).init(allocator),
+            .string_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
@@ -77,6 +81,7 @@ pub const Analyzer = struct {
         return .{
             .errors = analyzer.errors.toOwnedSlice() catch &[_]AnalyzerError{},
             .allocator = allocator,
+            .arena = analyzer.string_arena,
         };
     }
 
@@ -133,7 +138,7 @@ pub const Analyzer = struct {
                 .match_on_unconstrained,
                 match_stmt.variable_loc,
                 "match can only be used on parameters with constrained values",
-                std.fmt.allocPrint(self.allocator, "add constraints like '{s}: {{opt1|opt2}}' to enable match", .{match_stmt.variable}) catch null,
+                std.fmt.allocPrint(self.string_arena.allocator(), "add constraints like '{s}: {{opt1|opt2}}' to enable match", .{match_stmt.variable}) catch null,
             );
             return;
         };
@@ -154,7 +159,7 @@ pub const Analyzer = struct {
                 }
                 if (!is_valid) {
                     // Build valid options string for hint
-                    var opts_list = std.array_list.Managed(u8).init(self.allocator);
+                    var opts_list = std.array_list.Managed(u8).init(self.string_arena.allocator());
                     for (options, 0..) |opt, i| {
                         opts_list.appendSlice(opt) catch {};
                         if (i < options.len - 1) {
@@ -166,8 +171,8 @@ pub const Analyzer = struct {
                     self.addError(
                         .invalid_match_value,
                         match_stmt.variable_loc,
-                        std.fmt.allocPrint(self.allocator, "'{s}' is not a valid option for parameter '{s}'", .{ value, match_stmt.variable }) catch "invalid match value",
-                        if (opts_str) |s| std.fmt.allocPrint(self.allocator, "valid options are: {s}", .{s}) catch null else null,
+                        std.fmt.allocPrint(self.string_arena.allocator(), "'{s}' is not a valid option for parameter '{s}'", .{ value, match_stmt.variable }) catch "invalid match value",
+                        if (opts_str) |s| std.fmt.allocPrint(self.string_arena.allocator(), "valid options are: {s}", .{s}) catch null else null,
                     );
                 }
 
@@ -176,7 +181,7 @@ pub const Analyzer = struct {
                     self.addError(
                         .duplicate_match_value,
                         match_stmt.variable_loc,
-                        std.fmt.allocPrint(self.allocator, "'{s}' appears in multiple match arms", .{value}) catch "duplicate match value",
+                        std.fmt.allocPrint(self.string_arena.allocator(), "'{s}' appears in multiple match arms", .{value}) catch "duplicate match value",
                         null,
                     );
                 } else {
@@ -200,7 +205,7 @@ pub const Analyzer = struct {
 
         if (missing.items.len > 0) {
             // Build missing values string
-            var missing_str = std.array_list.Managed(u8).init(self.allocator);
+            var missing_str = std.array_list.Managed(u8).init(self.string_arena.allocator());
             for (missing.items, 0..) |m, i| {
                 missing_str.appendSlice(m) catch {};
                 if (i < missing.items.len - 1) {
@@ -212,7 +217,7 @@ pub const Analyzer = struct {
                 .non_exhaustive_match,
                 match_stmt.variable_loc,
                 "match is not exhaustive",
-                std.fmt.allocPrint(self.allocator, "missing values: {s}", .{missing_str.toOwnedSlice() catch "?"}) catch null,
+                std.fmt.allocPrint(self.string_arena.allocator(), "missing values: {s}", .{missing_str.toOwnedSlice() catch "?"}) catch null,
             );
         }
     }
@@ -254,7 +259,7 @@ pub const Analyzer = struct {
             }
 
             const hint_msg = if (hint) |h|
-                std.fmt.allocPrint(self.allocator, "did you mean '{s}'?", .{h}) catch null
+                std.fmt.allocPrint(self.string_arena.allocator(), "did you mean '{s}'?", .{h}) catch null
             else
                 null;
 
